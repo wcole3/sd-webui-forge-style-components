@@ -5,11 +5,14 @@ import contextlib
 import os
 import math
 
-import ldm_patched.modules.utils
-import ldm_patched.modules.model_management
-from ldm_patched.modules.clip_vision import clip_preprocess
-from ldm_patched.ldm.modules.attention import optimized_attention
-from ldm_patched.utils import path_utils as folder_paths
+from backend.patcher.clipvision import clip_preprocess
+from backend.attention import attention_function
+
+from backend import memory_management
+from backend.utils import load_torch_file
+from backend.misc.image_resize import adaptive_resize
+from modules.paths_internal import data_path
+from modules_forge.shared import controlnet_dir, models_path
 
 from torch import nn
 from PIL import Image
@@ -19,15 +22,16 @@ import torchvision.transforms as TT
 from .resampler import PerceiverAttention, FeedForward, Resampler
 
 # set the models directory backward compatible
-GLOBAL_MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter")
+GLOBAL_MODELS_DIR = os.path.join(models_path, "ipadapter")
 MODELS_DIR = GLOBAL_MODELS_DIR if os.path.isdir(GLOBAL_MODELS_DIR) else os.path.join(os.path.dirname(os.path.realpath(__file__)), "models")
-if "ipadapter" not in folder_paths.folder_names_and_paths:
-    current_paths = [MODELS_DIR]
-else:
-    current_paths, _ = folder_paths.folder_names_and_paths["ipadapter"]
-folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
+INSIGHTFACE_DIR = os.path.join(models_path, "insightface")
+#variables associated with old paths
+supported_pt_extensions = set(['.ckpt', '.pt', '.bin', '.pth', '.safetensors'])
+input_directory = os.path.join(data_path, "input")
+output_directory = os.path.join(data_path, "output")
 
-INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
+
+
 
 class FacePerceiverResampler(torch.nn.Module):
     def __init__(
@@ -186,10 +190,10 @@ def image_add_noise(image, noise):
 
 def zeroed_hidden_states(clip_vision, batch_size):
     image = torch.zeros([batch_size, 224, 224, 3])
-    ldm_patched.modules.model_management.load_model_gpu(clip_vision.patcher)
+    memory_management.load_model_gpu(clip_vision.patcher)
     pixel_values = clip_preprocess(image.to(clip_vision.load_device)).float()
     outputs = clip_vision.model(pixel_values=pixel_values, output_hidden_states=True)
-    outputs = outputs.hidden_states[-2].to(ldm_patched.modules.model_management.intermediate_device())
+    outputs = outputs.hidden_states[-2].to(memory_management.intermediate_device())
     return outputs
 
 def min_(tensor_list):
@@ -399,7 +403,7 @@ class CrossAttentionPatch:
         b = q.shape[0]
         qs = q.shape[1]
         batch_prompt = b // len(cond_or_uncond)
-        out = optimized_attention(q, k, v, extra_options["n_heads"])
+        out = attention_function(q, k, v, extra_options["n_heads"])
         
         _, _, lh, lw = extra_options["original_shape"]
         
@@ -507,16 +511,17 @@ class CrossAttentionPatch:
 class IPAdapterModelLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "ipadapter_file": (folder_paths.get_filename_list("ipadapter"), )}}
+        files = os.listdir(os.path.join(controlnet_dir, "ipadapter"))
+        return {"required": { "ipadapter_file": (files[0] if len(files) > 0 else "", )}}
 
     RETURN_TYPES = ("IPADAPTER",)
     FUNCTION = "load_ipadapter_model"
     CATEGORY = "ipadapter"
 
     def load_ipadapter_model(self, ipadapter_file):
-        ckpt_path = folder_paths.get_full_path("ipadapter", ipadapter_file)
+        ckpt_path = os.path.join(controlnet_dir, "ipadapter", ipadapter_file)
 
-        model = ldm_patched.modules.utils.load_torch_file(ckpt_path, safe_load=True)
+        model = load_torch_file(ckpt_path, safe_load=True)
 
         if ckpt_path.lower().endswith(".safetensors"):
             st_model = {"image_proj": {}, "ip_adapter": {}}
@@ -606,8 +611,8 @@ class IPAdapterApply:
     def apply_ipadapter(self, ipadapter, model, weight, clip_vision=None, image=None, weight_type="original",
                         noise=None, embeds=None, attn_mask=None, start_at=0.0, end_at=1.0, unfold_batch=False,
                         insightface=None, faceid_v2=False, weight_v2=False, instant_id=False):
-        self.dtype = torch.float16 if ldm_patched.modules.model_management.should_use_fp16() else torch.float32
-        self.device = ldm_patched.modules.model_management.get_torch_device()
+        self.dtype = torch.float16 if memory_management.should_use_fp16() else torch.float32
+        self.device = memory_management.get_torch_device()
         self.weight = weight
         self.is_full = "proj.3.weight" in ipadapter["image_proj"]
         self.is_portrait = "proj.2.weight" in ipadapter["image_proj"] and not "proj.3.weight" in ipadapter["image_proj"] and not "0.to_q_lora.down.weight" in ipadapter["ip_adapter"]
@@ -658,8 +663,8 @@ class IPAdapterApply:
         if attn_mask is not None:
             attn_mask = attn_mask.to(self.device)
 
-        sigma_start = model.model.model_sampling.percent_to_sigma(start_at)
-        sigma_end = model.model.model_sampling.percent_to_sigma(end_at)
+        sigma_start = model.model.predictor.percent_to_sigma(start_at)
+        sigma_end = model.model.predictor.percent_to_sigma(end_at)
 
         patch_kwargs = {
             "number": 0,
@@ -854,17 +859,17 @@ class IPAdapterEncoder:
         
         if image_2 is not None:
             if image_1.shape[1:] != image_2.shape[1:]:
-                image_2 = ldm_patched.modules.utils.common_upscale(image_2.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
+                image_2 = adaptive_resize(image_2.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
             image = torch.cat((image, image_2), dim=0)
             weight += [weight_2]*image_2.shape[0]
         if image_3 is not None:
             if image.shape[1:] != image_3.shape[1:]:
-                image_3 = ldm_patched.modules.utils.common_upscale(image_3.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
+                image_3 = adaptive_resize(image_3.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
             image = torch.cat((image, image_3), dim=0)
             weight += [weight_3]*image_3.shape[0]
         if image_4 is not None:
             if image.shape[1:] != image_4.shape[1:]:
-                image_4 = ldm_patched.modules.utils.common_upscale(image_4.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
+                image_4 = adaptive_resize(image_4.movedim(-1,1), image.shape[2], image.shape[1], "bilinear", "center").movedim(1,-1)
             image = torch.cat((image, image_4), dim=0)
             weight += [weight_4]*image_4.shape[0]
         
@@ -913,7 +918,7 @@ class IPAdapterApplyEncoded(IPAdapterApply):
 
 class IPAdapterSaveEmbeds:
     def __init__(self):
-        self.output_dir = folder_paths.get_output_directory()
+        self.output_dir = os.path.join(output_directory, "embeds")
 
     @classmethod
     def INPUT_TYPES(s):
@@ -929,9 +934,16 @@ class IPAdapterSaveEmbeds:
     CATEGORY = "ipadapter"
 
     def save(self, embeds, filename_prefix):
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
-        file = f"{filename}_{counter:05}_.ipadpt"
-        file = os.path.join(full_output_folder, file)
+        # check if the filename_prefix already exists in the output directory, if it does use a counter to make it unique
+        counter = 0
+        file = os.path.join(self.output_dir, f"{filename_prefix}_{counter:05}.ipadpt")
+        while os.path.exists(file):
+            counter += 1
+            file = os.path.join(self.output_dir, f"{filename_prefix}_{counter:05}.ipadpt")
+            # safety exit if counter somehow got above 10000
+            if counter > 10000:
+                raise Exception(f"Counter for saving embeds got too high, please check the output directory for "
+                                f"conflicting files. Directory: {self.output_dir}")
 
         torch.save(embeds, file)
         return (None, )
@@ -940,8 +952,8 @@ class IPAdapterSaveEmbeds:
 class IPAdapterLoadEmbeds:
     @classmethod
     def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = [os.path.relpath(os.path.join(root, file), input_dir) for root, dirs, files in os.walk(input_dir) for file in files if file.endswith('.ipadpt')]
+        input_dir = input_directory
+        files = [os.folder_paths.get_path.relpath(os.path.join(root, file), input_dir) for root, dirs, files in os.walk(input_dir) for file in files if file.endswith('.ipadpt')]
         return {"required": {"embeds": [sorted(files), ]}, }
 
     RETURN_TYPES = ("EMBEDS", )
@@ -949,7 +961,7 @@ class IPAdapterLoadEmbeds:
     CATEGORY = "ipadapter"
 
     def load(self, embeds):
-        path = folder_paths.get_annotated_filepath(embeds)
+        path = os.path.join(input_directory, embeds)
         output = torch.load(path).cpu()
 
         return (output, )
